@@ -1,0 +1,135 @@
+name: Reusable Code Lint
+
+on:
+  workflow_call:
+
+env:
+  PMD_VERSION: "7.12.0"
+  SPOTBUGS_VERSION: "4.8.3"
+  VIOLATION_THRESHOLD: 10
+
+jobs:
+  code_lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Restore PMD from cache
+        id: cache-pmd
+        uses: actions/cache@v3
+        with:
+          path: ~/.pmd/pmd-bin-${{ env.PMD_VERSION }}
+          key: pmd-${{ env.PMD_VERSION }}-${{ runner.os }}
+
+      - name: Install PMD (if not cached)
+        if: steps.cache-pmd.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.pmd
+          PMD_URL="https://github.com/pmd/pmd/releases/download/pmd_releases%2F${PMD_VERSION}/pmd-dist-${PMD_VERSION}-bin.zip"
+          curl -L "$PMD_URL" -o ~/.pmd/pmd.zip
+          unzip -o ~/.pmd/pmd.zip -d ~/.pmd
+          chmod +x ~/.pmd/pmd-bin-${PMD_VERSION}/bin/pmd
+
+      - name: Set PMD binary path
+        run: echo "PMD_BIN=$HOME/.pmd/pmd-bin-${PMD_VERSION}/bin/pmd" >> $GITHUB_ENV
+
+      - name: Run PMD Static Analysis (multi-dir)
+        run: |
+          SRC_DIRS=$(find . -type d -name src -not -path "*/test/*" | paste -sd "," -)
+          echo "Detected Java source directories: $SRC_DIRS"
+
+          $PMD_BIN check \
+            --no-progress \
+            -d "$SRC_DIRS" \
+            -R rulesets/java/quickstart.xml \
+            -f json \
+            --report-file pmd-report.json || PMD_EXIT=$?
+
+          if [ "$PMD_EXIT" = "4" ]; then
+            echo "PMD completed with violations (exit code 4). Suppressing error."
+          elif [ -n "$PMD_EXIT" ] && [ "$PMD_EXIT" -ne 0 ]; then
+            echo "PMD failed with exit code $PMD_EXIT"
+            exit $PMD_EXIT
+          fi
+
+          if [ ! -s pmd-report.json ]; then
+            echo '{"files": []}' > pmd-report.json
+          fi
+
+      - name: Build Project for SpotBugs
+        run: mvn clean compile -DskipTests
+
+      - name: Run SpotBugs with SARIF Output
+        continue-on-error: true
+        run: |
+          mkdir -p spotbugs-output
+          curl -L https://repo1.maven.org/maven2/com/github/spotbugs/spotbugs/${SPOTBUGS_VERSION}/spotbugs-${SPOTBUGS_VERSION}.zip -o spotbugs.zip
+          unzip -o spotbugs.zip -d spotbugs-dist
+          chmod +x spotbugs-dist/spotbugs-${SPOTBUGS_VERSION}/bin/spotbugs
+
+          spotbugs-dist/spotbugs-${SPOTBUGS_VERSION}/bin/spotbugs \
+            -textui \
+            -sarif \
+            -output spotbugs-output/spotbugs.sarif \
+            target/classes
+
+      - name: Convert PMD JSON to SARIF
+        run: python3 scripts/pmd_to_sarif.py pmd-report.json pmd-report.sarif
+
+      - name: Add Fingerprints and Combine SARIF Reports
+        run: python3 scripts/combine_sarif_with_fingerprints.py pmd-report.sarif spotbugs-output/spotbugs.sarif combined.sarif
+
+      - name: Upload Combined SARIF to GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: combined.sarif
+          category: "pmd-spotbugs-lint"
+
+      - name: 🧪 Unified Markdown Summary (PMD + SpotBugs)
+        if: always()
+        run: |
+          echo "## 🧪 Code Quality Report (PMD + SpotBugs)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Tool | File | Line | Rule | Message |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|------|------|---------|" >> $GITHUB_STEP_SUMMARY
+
+          # PMD violations
+          jq -c '.files[] | .filename as $f | .violations[] | {tool: "PMD", file: $f, line: .beginline, rule: .rule, message: .description}' pmd-report.json | while read -r line; do
+            file=$(echo "$line" | jq -r '.file')
+            line_number=$(echo "$line" | jq -r '.line')
+            rule=$(echo "$line" | jq -r '.rule')
+            message=$(echo "$line" | jq -r '.message' | sed 's/|/\\|/g')
+            echo "| PMD | $file | $line_number | $rule | $message |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          # SpotBugs violations
+          if [ -f spotbugs-output/spotbugs.sarif ]; then
+            jq -c '.runs[].results[] | {tool: "SpotBugs", file: .locations[0].physicalLocation.artifactLocation.uri, line: .locations[0].physicalLocation.region.startLine, rule: .ruleId, message: .message.text}' spotbugs-output/spotbugs.sarif | while read -r line; do
+              file=$(echo "$line" | jq -r '.file')
+              line_number=$(echo "$line" | jq -r '.line')
+              rule=$(echo "$line" | jq -r '.rule')
+              message=$(echo "$line" | jq -r '.message' | sed 's/|/\\|/g')
+              echo "| SpotBugs | $file | $line_number | $rule | $message |" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
+
+      - name: 🚦 Quality Gate - Fail if too many violations
+        if: always()
+        run: |
+          PMD_COUNT=$(jq '[.files[].violations[]] | length' pmd-report.json)
+          SPOT_COUNT=0
+          if [ -f spotbugs-output/spotbugs.sarif ]; then
+            SPOT_COUNT=$(jq '[.runs[].results[]] | length' spotbugs-output/spotbugs.sarif)
+          fi
+
+          TOTAL=$((PMD_COUNT + SPOT_COUNT))
+          echo "Total Violations: $TOTAL"
+
+          if [ "$TOTAL" -gt "$VIOLATION_THRESHOLD" ]; then
+            echo "❌ Violation threshold ($VIOLATION_THRESHOLD) exceeded: $TOTAL issues found."
+            exit 1
+          else
+            echo "✅ Violation count ($TOTAL) is within the threshold ($VIOLATION_THRESHOLD)."
+          fi
