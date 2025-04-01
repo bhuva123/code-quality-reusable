@@ -76,10 +76,11 @@ jobs:
             target/classes
 
       - name: Convert PMD JSON to SARIF
-        run: python3 scripts/pmd_to_sarif.py pmd-report.json pmd-report.sarif
+        run: python3 .github/scripts/pmd_to_sarif.py pmd-report.json pmd-report.sarif
 
       - name: Add Fingerprints and Combine SARIF Reports
-        run: python3 scripts/combine_sarif_with_fingerprints.py pmd-report.sarif spotbugs-output/spotbugs.sarif combined.sarif
+        run: python3 .github/scripts/combine_sarif_with_fingerprints.py pmd-report.sarif spotbugs-output/spotbugs.sarif combined.sarif
+
 
       - name: Upload Combined SARIF to GitHub
         uses: github/codeql-action/upload-sarif@v3
