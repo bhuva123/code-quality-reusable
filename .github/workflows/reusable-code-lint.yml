@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
+      - name: Checkout source code
         uses: actions/checkout@v4
 
       - name: Restore PMD from cache
@@ -58,10 +58,10 @@ jobs:
             echo '{"files": []}' > pmd-report.json
           fi
 
-      - name: Build Project for SpotBugs
+      - name: Build project for SpotBugs
         run: mvn clean compile -DskipTests
 
-      - name: Run SpotBugs with SARIF Output
+      - name: Run SpotBugs with SARIF output
         continue-on-error: true
         run: |
           mkdir -p spotbugs-output
@@ -75,12 +75,17 @@ jobs:
             -output spotbugs-output/spotbugs.sarif \
             target/classes
 
+      - name: Checkout reusable workflow repo
+        uses: actions/checkout@v4
+        with:
+          repository: bhuva123/code-quality-reusable
+          path: reusable-workflow
+
       - name: Convert PMD JSON to SARIF
-        run: python3 .github/scripts/pmd_to_sarif.py pmd-report.json pmd-report.sarif
+        run: python3 reusable-workflow/.github/scripts/pmd_to_sarif.py pmd-report.json pmd-report.sarif
 
       - name: Add Fingerprints and Combine SARIF Reports
-        run: python3 .github/scripts/combine_sarif_with_fingerprints.py pmd-report.sarif spotbugs-output/spotbugs.sarif combined.sarif
-
+        run: python3 reusable-workflow/.github/scripts/combine_sarif_with_fingerprints.py pmd-report.sarif spotbugs-output/spotbugs.sarif combined.sarif
 
       - name: Upload Combined SARIF to GitHub
         uses: github/codeql-action/upload-sarif@v3
@@ -96,7 +101,6 @@ jobs:
           echo "| Tool | File | Line | Rule | Message |" >> $GITHUB_STEP_SUMMARY
           echo "|------|------|------|------|---------|" >> $GITHUB_STEP_SUMMARY
 
-          # PMD violations
           jq -c '.files[] | .filename as $f | .violations[] | {tool: "PMD", file: $f, line: .beginline, rule: .rule, message: .description}' pmd-report.json | while read -r line; do
             file=$(echo "$line" | jq -r '.file')
             line_number=$(echo "$line" | jq -r '.line')
@@ -105,7 +109,6 @@ jobs:
             echo "| PMD | $file | $line_number | $rule | $message |" >> $GITHUB_STEP_SUMMARY
           done
 
-          # SpotBugs violations
           if [ -f spotbugs-output/spotbugs.sarif ]; then
             jq -c '.runs[].results[] | {tool: "SpotBugs", file: .locations[0].physicalLocation.artifactLocation.uri, line: .locations[0].physicalLocation.region.startLine, rule: .ruleId, message: .message.text}' spotbugs-output/spotbugs.sarif | while read -r line; do
               file=$(echo "$line" | jq -r '.file')
